@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, type ReactNode } from "react";
 
 // ─── Theme ───────────────────────────────────────────────────────────────────
 const themes = {
@@ -230,6 +230,65 @@ function StarRating({ value, onChange, color, theme }: { value: number; onChange
   );
 }
 
+// ─── Tooltip ─────────────────────────────────────────────────────────────────
+function Tooltip({ text, theme, children }: { text: string; theme: Theme; children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLSpanElement>(null);
+  const canHoverRef = useRef(false);
+
+  useEffect(() => {
+    canHoverRef.current = window.matchMedia("(hover: hover)").matches;
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const onOutside = (e: PointerEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", onOutside);
+    return () => document.removeEventListener("pointerdown", onOutside);
+  }, [open]);
+
+  return (
+    <span
+      ref={wrapRef}
+      tabIndex={0}
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={() => setOpen(true)}
+      onBlur={() => setOpen(false)}
+      onClick={() => { if (!canHoverRef.current) setOpen((o) => !o); }}
+      style={{
+        fontSize: 12, color: theme.textMuted, cursor: "help", flex: 1,
+        fontFamily: FONT_BODY, position: "relative", outline: "none",
+      }}
+    >
+      {children}
+      <div role="tooltip" aria-hidden={!open} style={{
+        position: "absolute", bottom: "calc(100% + 8px)", left: 0, zIndex: 1000,
+        maxWidth: 220, width: "max-content", padding: "8px 10px",
+        background: theme.cardBg, border: `1px solid ${theme.cardBorder}`,
+        borderRadius: 8, color: theme.text, fontSize: 11, lineHeight: 1.4,
+        fontWeight: 400, fontFamily: FONT_BODY, whiteSpace: "normal",
+        boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
+        opacity: open ? 1 : 0, pointerEvents: "none",
+        transform: open ? "translateY(0) scale(1)" : "translateY(4px) scale(0.96)",
+        transformOrigin: "bottom left",
+        transition: "opacity 0.2s, transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1)",
+      }}>
+        {text}
+        <span style={{
+          position: "absolute", top: "100%", left: 14, width: 8, height: 8,
+          background: theme.cardBg,
+          borderRight: `1px solid ${theme.cardBorder}`,
+          borderBottom: `1px solid ${theme.cardBorder}`,
+          transform: "rotate(45deg) translateY(-4px)",
+        }} />
+      </div>
+    </span>
+  );
+}
+
 // ─── Verdict Badge ───────────────────────────────────────────────────────────
 function VerdictBadge({ score, lang, weights }: { score: number; lang: LangKey; weights: number[] }) {
   const maxPossible = weights.reduce((s, w) => s + w * 5, 0);
@@ -366,7 +425,7 @@ function decodeState(hash: string) {
     const json = JSON.parse(decodeURIComponent(atob(hash)));
     return {
       lang: (json.l || "de") as LangKey,
-      mode: (json.m || "dark") as ThemeKey,
+      mode: (json.m || "light") as ThemeKey,
       weights: json.w as number[] || [...DEFAULT_WEIGHTS],
       ideas: json.i.map((item: { n: string; d: string; r: number[] }) => ({ ...emptyIdea(), name: item.n, desc: item.d, ratings: item.r })),
     };
@@ -394,7 +453,7 @@ function ThemeToggle({ mode, setMode }: { mode: ThemeKey; setMode: (m: ThemeKey)
 // ─── Main App ────────────────────────────────────────────────────────────────
 export default function Ideenmatrix() {
   const [lang, setLang] = useState<LangKey>("de");
-  const [mode, setMode] = useState<ThemeKey>("dark");
+  const [mode, setMode] = useState<ThemeKey>("light");
   const [ideas, setIdeas] = useState<Idea[]>([emptyIdea(), emptyIdea()]);
   const [weights, setWeights] = useState([...DEFAULT_WEIGHTS]);
   const [showWeights, setShowWeights] = useState(false);
@@ -553,9 +612,8 @@ export default function Ideenmatrix() {
               borderRadius: 16, padding: 24, position: "relative",
               transition: "border-color 0.3s, box-shadow 0.3s, background 0.4s",
               boxShadow: score > 0 ? `0 4px 30px ${color}15` : "none",
-              overflow: "hidden",
             }}>
-              <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: color, opacity: 0.7 }} />
+              <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: color, opacity: 0.7, borderRadius: "16px 16px 0 0" }} />
 
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
                 <span style={{
@@ -601,12 +659,12 @@ export default function Ideenmatrix() {
                 {t.criteria.map((c, ci) => (
                   <div key={ci}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <span style={{ fontSize: 12, color: th.textMuted, cursor: "help", flex: 1, fontFamily: FONT_BODY }} title={c.tip}>
+                      <Tooltip text={c.tip} theme={th}>
                         {c.name}
                         {weights[ci] >= 2 && (
                           <span style={{ color: "#E8572A", marginLeft: 4, fontSize: 10 }}>x{weights[ci]}</span>
                         )}
-                      </span>
+                      </Tooltip>
                       <StarRating
                         value={idea.ratings[ci]}
                         onChange={(val) => updateRating(idea.id, ci, val)}
