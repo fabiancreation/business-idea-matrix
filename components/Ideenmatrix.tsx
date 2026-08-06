@@ -89,7 +89,10 @@ const T = {
     reset: "Zurücksetzen",
     maxScore: "Max. erreichbar",
     exportPdf: "PDF exportieren",
-    exportCsv: "Excel (CSV)",
+    exportXlsx: "Excel (.xlsx)",
+    exporting: "Wird erstellt …",
+    sheetName: "Ideenmatrix",
+    xlsxHint: "Tipp: Gewichte in Spalte B anpassen — Gesamt und Empfehlung rechnen sich automatisch neu.",
     criterion: "Kriterium",
     weight: "Gewicht",
     description: "Beschreibung",
@@ -131,7 +134,10 @@ const T = {
     reset: "Reset",
     maxScore: "Max. achievable",
     exportPdf: "Export PDF",
-    exportCsv: "Excel (CSV)",
+    exportXlsx: "Excel (.xlsx)",
+    exporting: "Building …",
+    sheetName: "Idea Matrix",
+    xlsxHint: "Tip: adjust the weights in column B — totals and recommendation recalculate automatically.",
     criterion: "Criterion",
     weight: "Weight",
     description: "Description",
@@ -510,45 +516,9 @@ function ThemeToggle({ mode, setMode }: { mode: ThemeKey; setMode: (m: ThemeKey)
   );
 }
 
-// ─── CSV Export ──────────────────────────────────────────────────────────────
-function buildCSV(ideas: Idea[], weights: number[], lang: LangKey) {
-  const t = T[lang];
-  const de = lang === "de";
-  // German Excel defaults to semicolon separators and comma decimals.
-  const sep = de ? ";" : ",";
-  const num = (n: number) => (de ? n.toFixed(1).replace(".", ",") : n.toFixed(1));
-  const esc = (v: string | number) => `"${String(v).replace(/"/g, '""')}"`;
-  const row = (cells: (string | number)[]) => cells.map(esc).join(sep);
-
-  const cols = ideas.map((idea, i) => ({
-    label: idea.name || `${t.idea} ${i + 1}`,
-    desc: idea.desc,
-    ratings: idea.ratings,
-    score: scoreOf(idea, weights),
-  }));
-  const { maxPossible } = thresholds(weights);
-
-  const lines = [
-    row([`${t.title} — ${t.subtitle}`]),
-    row([t.date, new Date().toLocaleDateString(de ? "de-DE" : "en-US")]),
-    "",
-    row([t.criterion, t.weight, ...cols.map((c) => c.label)]),
-    row([t.description, "", ...cols.map((c) => c.desc)]),
-    ...t.criteria.map((c, ci) => row([c.name, num(weights[ci]), ...cols.map((col) => col.ratings[ci] || 0)])),
-    "",
-    row([t.total, "", ...cols.map((c) => num(c.score))]),
-    row([t.maxScore, "", ...cols.map(() => num(maxPossible))]),
-    row([t.recommendation, "", ...cols.map((c) => verdictFor(c.score, weights, lang).label)]),
-    "",
-    row([t.scaleNote]),
-  ];
-
-  // Leading BOM so Excel reads the file as UTF-8 instead of mangling umlauts.
-  return "﻿" + lines.join("\r\n");
-}
-
-function downloadFile(filename: string, content: string, mime: string) {
-  const url = URL.createObjectURL(new Blob([content], { type: mime }));
+// ─── Download ────────────────────────────────────────────────────────────────
+function downloadBlob(filename: string, blob: Blob) {
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
@@ -727,6 +697,7 @@ export default function Ideenmatrix() {
   const [showWeights, setShowWeights] = useState(false);
   const [copied, setCopied] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
   const th = themes[mode];
 
@@ -770,9 +741,34 @@ export default function Ideenmatrix() {
 
   const handlePrint = () => window.print();
 
-  const handleCsv = () => {
-    const stamp = new Date().toISOString().slice(0, 10);
-    downloadFile(`ideenmatrix-${stamp}.csv`, buildCSV(ideas, weights, lang), "text/csv;charset=utf-8;");
+  // ExcelJS is pulled in on demand so it never lands in the initial bundle.
+  const handleXlsx = async () => {
+    setExporting(true);
+    try {
+      const { buildWorkbook } = await import("@/lib/xlsx-export");
+      const wb = await buildWorkbook({
+        ideas: ideas.map((i) => ({ name: i.name, desc: i.desc, ratings: i.ratings })),
+        weights,
+        criteria: t.criteria.map((c) => c.name),
+        labels: {
+          sheetName: t.sheetName, title: t.title, subtitle: t.subtitle, date: t.date,
+          idea: t.idea, criterion: t.criterion, weight: t.weight, description: t.description,
+          total: t.total, maxScore: t.maxScore, recommendation: t.recommendation,
+          go: t.go, goMicro: t.goMicro, park: t.park, hint: t.xlsxHint,
+        },
+        locale: lang === "de" ? "de-DE" : "en-US",
+      });
+      const buffer = await wb.xlsx.writeBuffer();
+      const stamp = new Date().toISOString().slice(0, 10);
+      downloadBlob(
+        `ideenmatrix-${stamp}.xlsx`,
+        new Blob([buffer as ArrayBuffer], {
+          type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }),
+      );
+    } finally {
+      setExporting(false);
+    }
   };
 
   const handleShare = () => {
@@ -1026,13 +1022,14 @@ export default function Ideenmatrix() {
         }}>
           {"📄"} {t.exportPdf}
         </button>
-        <button onClick={handleCsv} style={{
+        <button onClick={handleXlsx} disabled={exporting} style={{
           background: th.btnSecBg, color: th.btnSecColor,
           border: `1px solid ${th.btnSecBorder}`, borderRadius: 10,
           padding: "10px 24px", fontSize: 14, fontWeight: 600,
-          cursor: "pointer", transition: "all 0.2s", fontFamily: FONT_BODY,
+          cursor: exporting ? "wait" : "pointer", opacity: exporting ? 0.6 : 1,
+          transition: "all 0.2s", fontFamily: FONT_BODY,
         }}>
-          {"📊"} {t.exportCsv}
+          {"📊"} {exporting ? t.exporting : t.exportXlsx}
         </button>
         <button onClick={resetAll} style={{
           background: th.btnSecBg, color: th.btnSecColor,
