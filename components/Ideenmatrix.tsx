@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useRef, useCallback, type ReactNode } from "react";
+import { useState, useEffect, useRef, useCallback, useSyncExternalStore, type ReactNode, type CSSProperties } from "react";
 
 // ─── Theme ───────────────────────────────────────────────────────────────────
 const themes = {
@@ -88,6 +88,19 @@ const T = {
     share: "Ergebnisse teilen",
     reset: "Zurücksetzen",
     maxScore: "Max. erreichbar",
+    exportPdf: "PDF exportieren",
+    exportCsv: "Excel (CSV)",
+    criterion: "Kriterium",
+    weight: "Gewicht",
+    description: "Beschreibung",
+    recommendation: "Empfehlung",
+    rank: "Rang",
+    idea: "Idee",
+    date: "Datum",
+    ranking: "Rangliste",
+    details: "Detailbewertung",
+    noRatings: "Noch keine Bewertungen erfasst.",
+    scaleNote: "Bewertungsskala: 1 = schwach · 5 = hervorragend · Gewichte bestimmen die Bedeutung jedes Kriteriums",
     criteria: [
       { name: "Founder Fit", tip: "Wie gut passt die Idee zu deinen Skills, deiner Erfahrung und deiner Leidenschaft?" },
       { name: "Schmerz & Zahlungsbereitschaft", tip: "Wie groß ist das Problem und wie bereitwillig zahlt die Zielgruppe dafür?" },
@@ -117,6 +130,19 @@ const T = {
     share: "Share results",
     reset: "Reset",
     maxScore: "Max. achievable",
+    exportPdf: "Export PDF",
+    exportCsv: "Excel (CSV)",
+    criterion: "Criterion",
+    weight: "Weight",
+    description: "Description",
+    recommendation: "Recommendation",
+    rank: "Rank",
+    idea: "Idea",
+    date: "Date",
+    ranking: "Ranking",
+    details: "Detailed scores",
+    noRatings: "No ratings recorded yet.",
+    scaleNote: "Rating scale: 1 = weak · 5 = excellent · Weights determine each criterion's importance",
     criteria: [
       { name: "Founder Fit", tip: "How well does this idea match your skills, experience, and passion?" },
       { name: "Pain & Willingness to Pay", tip: "How big is the problem and how willing is the audience to pay?" },
@@ -133,6 +159,8 @@ const T = {
 type LangKey = keyof typeof T;
 
 const DEFAULT_WEIGHTS = [2.0, 2.0, 1.5, 1.5, 1.0, 1.0, 1.0, 0.5];
+
+const STORAGE_KEY = "ideenmatrix-state-v1";
 
 const COLORS = [
   "#E8572A", "#2A7DE8", "#2AE857", "#E8D02A", "#A32AE8", "#E82A8C", "#2AE8D0",
@@ -289,24 +317,32 @@ function Tooltip({ text, theme, children }: { text: string; theme: Theme; childr
   );
 }
 
+// ─── Scoring Helpers ─────────────────────────────────────────────────────────
+function thresholds(weights: number[]) {
+  const maxPossible = weights.reduce((s, w) => s + w * 5, 0);
+  return { maxPossible, goThresh: maxPossible * (40 / 52.5), microThresh: maxPossible * (32 / 52.5) };
+}
+
+function scoreOf(idea: Idea, weights: number[]) {
+  return idea.ratings.reduce((sum, r, i) => sum + r * weights[i], 0);
+}
+
+function verdictFor(score: number, weights: number[], lang: LangKey) {
+  const { goThresh, microThresh } = thresholds(weights);
+  const t = T[lang];
+  if (score >= goThresh) return { label: t.go, emoji: "🚀", bg: "linear-gradient(135deg, #0d9b4a, #15c361)", flat: "#0d9b4a" };
+  if (score >= microThresh) return { label: t.goMicro, emoji: "🧪", bg: "linear-gradient(135deg, #d4930a, #f0b429)", flat: "#d4930a" };
+  return { label: t.park, emoji: "⏸️", bg: "linear-gradient(135deg, #555, #777)", flat: "#666" };
+}
+
 // ─── Verdict Badge ───────────────────────────────────────────────────────────
 function VerdictBadge({ score, lang, weights }: { score: number; lang: LangKey; weights: number[] }) {
-  const maxPossible = weights.reduce((s, w) => s + w * 5, 0);
-  const goThresh = maxPossible * (40 / 52.5);
-  const microThresh = maxPossible * (32 / 52.5);
+  const { goThresh, microThresh } = thresholds(weights);
   const [show, setShow] = useState(false);
   const [confetti, setConfetti] = useState(false);
   const prevVerdict = useRef<string | null>(null);
-  const t = T[lang];
 
-  let verdict: string, bg: string, emoji: string;
-  if (score >= goThresh) {
-    verdict = t.go; bg = "linear-gradient(135deg, #0d9b4a, #15c361)"; emoji = "🚀";
-  } else if (score >= microThresh) {
-    verdict = t.goMicro; bg = "linear-gradient(135deg, #d4930a, #f0b429)"; emoji = "🧪";
-  } else {
-    verdict = t.park; bg = "linear-gradient(135deg, #555, #777)"; emoji = "⏸️";
-  }
+  const { label: verdict, bg, emoji } = verdictFor(score, weights, lang);
 
   useEffect(() => {
     if (score === 0) { setShow(false); prevVerdict.current = null; return; }
@@ -414,22 +450,46 @@ function ComparisonChart({ ideas, weights, lang, theme }: { ideas: Idea[]; weigh
   );
 }
 
-// ─── Share / URL State ───────────────────────────────────────────────────────
+// ─── Share / URL State + Local Persistence ───────────────────────────────────
+type StoredState = {
+  l?: string; m?: string; w?: number[];
+  i?: Array<{ n: string; d: string; r: number[] }>;
+};
+
+function serializeState(ideas: Idea[], weights: number[], lang: string, mode: string): StoredState {
+  return { l: lang, m: mode, w: weights, i: ideas.map((idea) => ({ n: idea.name, d: idea.desc, r: idea.ratings })) };
+}
+
+function hydrateState(json: StoredState) {
+  if (!Array.isArray(json.i) || json.i.length === 0) return null;
+  return {
+    lang: (json.l || "de") as LangKey,
+    mode: (json.m || "light") as ThemeKey,
+    weights: json.w || [...DEFAULT_WEIGHTS],
+    ideas: json.i.map((item) => ({ ...emptyIdea(), name: item.n, desc: item.d, ratings: item.r })),
+  };
+}
+
 function encodeState(ideas: Idea[], weights: number[], lang: string, mode: string) {
-  const data = { l: lang, m: mode, w: weights, i: ideas.map((idea) => ({ n: idea.name, d: idea.desc, r: idea.ratings })) };
-  return btoa(encodeURIComponent(JSON.stringify(data)));
+  return btoa(encodeURIComponent(JSON.stringify(serializeState(ideas, weights, lang, mode))));
 }
 
 function decodeState(hash: string) {
+  try { return hydrateState(JSON.parse(decodeURIComponent(atob(hash)))); }
+  catch { return null; }
+}
+
+// localStorage keeps entries across reloads; a share-link hash always wins over it.
+function loadStored() {
   try {
-    const json = JSON.parse(decodeURIComponent(atob(hash)));
-    return {
-      lang: (json.l || "de") as LangKey,
-      mode: (json.m || "light") as ThemeKey,
-      weights: json.w as number[] || [...DEFAULT_WEIGHTS],
-      ideas: json.i.map((item: { n: string; d: string; r: number[] }) => ({ ...emptyIdea(), name: item.n, desc: item.d, ratings: item.r })),
-    };
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? hydrateState(JSON.parse(raw)) : null;
   } catch { return null; }
+}
+
+function saveStored(ideas: Idea[], weights: number[], lang: string, mode: string) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(serializeState(ideas, weights, lang, mode))); }
+  catch { /* quota exceeded or private mode — persistence is best-effort */ }
 }
 
 // ─── Theme Toggle ────────────────────────────────────────────────────────────
@@ -450,6 +510,214 @@ function ThemeToggle({ mode, setMode }: { mode: ThemeKey; setMode: (m: ThemeKey)
   );
 }
 
+// ─── CSV Export ──────────────────────────────────────────────────────────────
+function buildCSV(ideas: Idea[], weights: number[], lang: LangKey) {
+  const t = T[lang];
+  const de = lang === "de";
+  // German Excel defaults to semicolon separators and comma decimals.
+  const sep = de ? ";" : ",";
+  const num = (n: number) => (de ? n.toFixed(1).replace(".", ",") : n.toFixed(1));
+  const esc = (v: string | number) => `"${String(v).replace(/"/g, '""')}"`;
+  const row = (cells: (string | number)[]) => cells.map(esc).join(sep);
+
+  const cols = ideas.map((idea, i) => ({
+    label: idea.name || `${t.idea} ${i + 1}`,
+    desc: idea.desc,
+    ratings: idea.ratings,
+    score: scoreOf(idea, weights),
+  }));
+  const { maxPossible } = thresholds(weights);
+
+  const lines = [
+    row([`${t.title} — ${t.subtitle}`]),
+    row([t.date, new Date().toLocaleDateString(de ? "de-DE" : "en-US")]),
+    "",
+    row([t.criterion, t.weight, ...cols.map((c) => c.label)]),
+    row([t.description, "", ...cols.map((c) => c.desc)]),
+    ...t.criteria.map((c, ci) => row([c.name, num(weights[ci]), ...cols.map((col) => col.ratings[ci] || 0)])),
+    "",
+    row([t.total, "", ...cols.map((c) => num(c.score))]),
+    row([t.maxScore, "", ...cols.map(() => num(maxPossible))]),
+    row([t.recommendation, "", ...cols.map((c) => verdictFor(c.score, weights, lang).label)]),
+    "",
+    row([t.scaleNote]),
+  ];
+
+  // Leading BOM so Excel reads the file as UTF-8 instead of mangling umlauts.
+  return "﻿" + lines.join("\r\n");
+}
+
+function downloadFile(filename: string, content: string, mime: string) {
+  const url = URL.createObjectURL(new Blob([content], { type: mime }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ─── Print Report (→ PDF via browser print dialog) ───────────────────────────
+// Rendered only for print, so the PDF gets a clean document layout while still
+// using the real brand fonts (which a generated-PDF library could not embed).
+const PRINT_CSS = `
+@media screen { .print-only { display: none; } }
+@media print {
+  .screen-only { display: none !important; }
+  .app-root { background: #fff !important; color: #111 !important; padding: 0 !important; min-height: 0 !important; opacity: 1 !important; }
+  .print-only * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+  .pr-block, .pr-row { break-inside: avoid; page-break-inside: avoid; }
+  @page { size: A4; margin: 14mm; }
+}
+`;
+
+const PR_HEAD: CSSProperties = {
+  padding: "6px 8px", borderBottom: "2px solid #111", fontSize: 9, textAlign: "left",
+  textTransform: "uppercase", letterSpacing: "0.06em", color: "#111", fontFamily: FONT_HEADING,
+};
+const PR_CELL: CSSProperties = { padding: "6px 8px", borderBottom: "1px solid #ddd", fontSize: 11, color: "#222" };
+const PR_H2: CSSProperties = {
+  fontFamily: FONT_HEADING, fontSize: 14, fontWeight: 700, color: "#111",
+  margin: "0 0 8px", letterSpacing: "0.02em",
+};
+
+const subscribeNever = () => () => {};
+
+function PrintReport({ ideas, weights, lang }: { ideas: Idea[]; weights: number[]; lang: LangKey }) {
+  const t = T[lang];
+  const { maxPossible } = thresholds(weights);
+
+  // The page is prerendered at build time, so rendering the date directly would
+  // bake in the build date and mismatch on hydration. An empty server snapshot
+  // keeps both sides in sync until the client takes over.
+  const dateStr = useSyncExternalStore(
+    subscribeNever,
+    () => new Date().toLocaleDateString(lang === "de" ? "de-DE" : "en-US", {
+      day: "2-digit", month: "long", year: "numeric",
+    }),
+    () => "",
+  );
+
+  const cols = ideas.map((idea, i) => ({
+    label: idea.name || `${t.idea} ${i + 1}`,
+    desc: idea.desc,
+    ratings: idea.ratings,
+    color: COLORS[i % COLORS.length],
+    score: scoreOf(idea, weights),
+  }));
+  const ranked = [...cols].filter((c) => c.score > 0).sort((a, b) => b.score - a.score);
+
+  return (
+    <div style={{ fontFamily: FONT_BODY, color: "#111", background: "#fff" }}>
+      <div className="pr-block" style={{ borderBottom: "3px solid #E8572A", paddingBottom: 10, marginBottom: 20 }}>
+        <h1 style={{ fontFamily: FONT_HEADING, fontSize: 26, fontWeight: 800, margin: 0, color: "#E8572A" }}>
+          {t.title}
+        </h1>
+        <p style={{
+          fontFamily: FONT_HEADING, fontSize: 10, fontWeight: 600, letterSpacing: "0.1em",
+          textTransform: "uppercase", color: "#666", margin: "2px 0 0",
+        }}>
+          {t.subtitle}
+        </p>
+        <p style={{ fontSize: 10, color: "#999", margin: "8px 0 0" }}>{t.date}: {dateStr}</p>
+      </div>
+
+      {ranked.length === 0 ? (
+        <p style={{ fontSize: 12, color: "#666" }}>{t.noRatings}</p>
+      ) : (
+        <>
+          <div className="pr-block" style={{ marginBottom: 26 }}>
+            <h2 style={PR_H2}>{t.ranking}</h2>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr>
+                  <th style={{ ...PR_HEAD, width: 34 }}>{t.rank}</th>
+                  <th style={PR_HEAD}>{t.idea}</th>
+                  <th style={{ ...PR_HEAD, textAlign: "right", width: 96 }}>{t.total}</th>
+                  <th style={{ ...PR_HEAD, width: 150 }}>{t.recommendation}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {ranked.map((c, i) => {
+                  const v = verdictFor(c.score, weights, lang);
+                  return (
+                    <tr key={i} className="pr-row">
+                      <td style={{ ...PR_CELL, fontWeight: 800, color: c.color, fontFamily: FONT_HEADING }}>{i + 1}</td>
+                      <td style={PR_CELL}>
+                        <span style={{ fontWeight: 700 }}>{c.label}</span>
+                        {c.desc && <span style={{ color: "#888", fontSize: 10 }}> — {c.desc}</span>}
+                      </td>
+                      <td style={{ ...PR_CELL, textAlign: "right", fontWeight: 800, fontFamily: FONT_HEADING }}>
+                        {c.score.toFixed(1)}
+                        <span style={{ color: "#aaa", fontWeight: 400, fontFamily: FONT_BODY }}> / {maxPossible.toFixed(1)}</span>
+                      </td>
+                      <td style={PR_CELL}>
+                        <span style={{
+                          background: v.flat, color: "#fff", padding: "2px 8px",
+                          borderRadius: 4, fontSize: 9, fontWeight: 700, letterSpacing: "0.04em",
+                        }}>
+                          {v.label}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="pr-block">
+            <h2 style={PR_H2}>{t.details}</h2>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr>
+                  <th style={PR_HEAD}>{t.criterion}</th>
+                  <th style={{ ...PR_HEAD, textAlign: "center", width: 52 }}>{t.weight}</th>
+                  {cols.map((c, i) => (
+                    <th key={i} style={{ ...PR_HEAD, textAlign: "center" }}>{c.label}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {t.criteria.map((crit, ci) => (
+                  <tr key={ci} className="pr-row">
+                    <td style={PR_CELL}>{crit.name}</td>
+                    <td style={{ ...PR_CELL, textAlign: "center", color: "#999" }}>×{weights[ci]}</td>
+                    {cols.map((c, i) => (
+                      <td key={i} style={{ ...PR_CELL, textAlign: "center", fontWeight: 600 }}>
+                        {c.ratings[ci] || "–"}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+                <tr className="pr-row">
+                  <td style={{ ...PR_CELL, fontWeight: 800, borderTop: "2px solid #111", fontFamily: FONT_HEADING }}>
+                    {t.total}
+                  </td>
+                  <td style={{ ...PR_CELL, borderTop: "2px solid #111" }} />
+                  {cols.map((c, i) => (
+                    <td key={i} style={{
+                      ...PR_CELL, textAlign: "center", fontWeight: 800,
+                      borderTop: "2px solid #111", color: c.color, fontFamily: FONT_HEADING,
+                    }}>
+                      {c.score.toFixed(1)}
+                    </td>
+                  ))}
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      <p style={{ fontSize: 9, color: "#aaa", marginTop: 22, borderTop: "1px solid #ddd", paddingTop: 8 }}>
+        {t.scaleNote}
+      </p>
+    </div>
+  );
+}
+
 // ─── Main App ────────────────────────────────────────────────────────────────
 export default function Ideenmatrix() {
   const [lang, setLang] = useState<LangKey>("de");
@@ -464,12 +732,16 @@ export default function Ideenmatrix() {
 
   useEffect(() => {
     const hash = window.location.hash.slice(1);
-    if (hash) {
-      const state = decodeState(hash);
-      if (state) { setLang(state.lang); setMode(state.mode); setWeights(state.weights); setIdeas(state.ideas); }
-    }
+    const state = hash ? decodeState(hash) : loadStored();
+    if (state) { setLang(state.lang); setMode(state.mode); setWeights(state.weights); setIdeas(state.ideas); }
     setTimeout(() => setLoaded(true), 50);
   }, []);
+
+  // Gated on `loaded` so the empty defaults can't overwrite stored state before it is restored.
+  useEffect(() => {
+    if (!loaded) return;
+    saveStored(ideas, weights, lang, mode);
+  }, [loaded, ideas, weights, lang, mode]);
 
   const t = T[lang];
 
@@ -493,6 +765,14 @@ export default function Ideenmatrix() {
     setWeights([...DEFAULT_WEIGHTS]);
     setShowWeights(false);
     window.location.hash = "";
+    try { localStorage.removeItem(STORAGE_KEY); } catch { /* best-effort */ }
+  };
+
+  const handlePrint = () => window.print();
+
+  const handleCsv = () => {
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadFile(`ideenmatrix-${stamp}.csv`, buildCSV(ideas, weights, lang), "text/csv;charset=utf-8;");
   };
 
   const handleShare = () => {
@@ -503,21 +783,22 @@ export default function Ideenmatrix() {
     });
   };
 
-  const calcScore = (idea: Idea) => idea.ratings.reduce((sum, r, i) => sum + r * weights[i], 0);
+  const calcScore = (idea: Idea) => scoreOf(idea, weights);
 
   return (
-    <div style={{
+    <div className="app-root" style={{
       minHeight: "100vh", background: th.bg, color: th.text,
       fontFamily: FONT_BODY, padding: "24px 16px 80px",
       opacity: loaded ? 1 : 0, transition: "opacity 0.5s, background 0.4s, color 0.4s",
     }}>
+      <style>{PRINT_CSS}</style>
       {/* eslint-disable-next-line @next/next/no-page-custom-font */}
       <link href="https://fonts.googleapis.com/css2?family=Lexend+Deca:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
       {/* eslint-disable-next-line @next/next/no-page-custom-font */}
       <link href="https://use.typekit.net/iff8jht.css" rel="stylesheet" />
 
       {/* ─── Header ─────────────────────────────────────── */}
-      <header style={{ maxWidth: 900, margin: "0 auto 32px", textAlign: "center" }}>
+      <header className="screen-only" style={{ maxWidth: 900, margin: "0 auto 32px", textAlign: "center" }}>
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 6, marginBottom: 16, alignItems: "center" }}>
           <ThemeToggle mode={mode} setMode={setMode} />
           <div style={{ width: 1, height: 20, background: th.cardBorder, margin: "0 4px" }} />
@@ -557,7 +838,7 @@ export default function Ideenmatrix() {
       </header>
 
       {/* ─── Weights Editor ─────────────────────────────── */}
-      <div style={{ maxWidth: 900, margin: "0 auto 20px" }}>
+      <div className="screen-only" style={{ maxWidth: 900, margin: "0 auto 20px" }}>
         <button onClick={() => setShowWeights(!showWeights)} style={{
           background: th.btnBg, border: `1px solid ${th.btnBorder}`,
           color: th.btnColor, borderRadius: 8, padding: "8px 18px",
@@ -596,7 +877,7 @@ export default function Ideenmatrix() {
       </div>
 
       {/* ─── Idea Cards ─────────────────────────────────── */}
-      <div style={{
+      <div className="screen-only" style={{
         maxWidth: 900, margin: "0 auto",
         display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 20,
       }}>
@@ -720,12 +1001,12 @@ export default function Ideenmatrix() {
       </div>
 
       {/* ─── Comparison Chart ───────────────────────────── */}
-      <div style={{ maxWidth: 900, margin: "0 auto" }}>
+      <div className="screen-only" style={{ maxWidth: 900, margin: "0 auto" }}>
         <ComparisonChart ideas={ideas} weights={weights} lang={lang} theme={th} />
       </div>
 
       {/* ─── Actions ────────────────────────────────────── */}
-      <div style={{
+      <div className="screen-only" style={{
         maxWidth: 900, margin: "32px auto 0",
         display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center",
       }}>
@@ -736,6 +1017,22 @@ export default function Ideenmatrix() {
           cursor: "pointer", transition: "all 0.3s", fontFamily: FONT_BODY,
         }}>
           {copied ? "✓ " + t.shareLink : "🔗 " + t.share}
+        </button>
+        <button onClick={handlePrint} style={{
+          background: th.btnSecBg, color: th.btnSecColor,
+          border: `1px solid ${th.btnSecBorder}`, borderRadius: 10,
+          padding: "10px 24px", fontSize: 14, fontWeight: 600,
+          cursor: "pointer", transition: "all 0.2s", fontFamily: FONT_BODY,
+        }}>
+          {"📄"} {t.exportPdf}
+        </button>
+        <button onClick={handleCsv} style={{
+          background: th.btnSecBg, color: th.btnSecColor,
+          border: `1px solid ${th.btnSecBorder}`, borderRadius: 10,
+          padding: "10px 24px", fontSize: 14, fontWeight: 600,
+          cursor: "pointer", transition: "all 0.2s", fontFamily: FONT_BODY,
+        }}>
+          {"📊"} {t.exportCsv}
         </button>
         <button onClick={resetAll} style={{
           background: th.btnSecBg, color: th.btnSecColor,
@@ -748,14 +1045,17 @@ export default function Ideenmatrix() {
       </div>
 
       {/* ─── Footer ─────────────────────────────────────── */}
-      <footer style={{
+      <footer className="screen-only" style={{
         maxWidth: 900, margin: "48px auto 0", textAlign: "center",
         fontSize: 11, color: th.textGhost, fontFamily: FONT_BODY,
       }}>
-        {lang === "de"
-          ? "Bewertungsskala: 1 = schwach · 5 = hervorragend · Gewichte bestimmen die Bedeutung jedes Kriteriums"
-          : "Rating scale: 1 = weak · 5 = excellent · Weights determine each criterion's importance"}
+        {t.scaleNote}
       </footer>
+
+      {/* ─── Print-only Report ──────────────────────────── */}
+      <div className="print-only">
+        <PrintReport ideas={ideas} weights={weights} lang={lang} />
+      </div>
     </div>
   );
 }
